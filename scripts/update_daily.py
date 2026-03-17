@@ -1,19 +1,19 @@
 """
-每日增量更新脚本 - 适配 GitHub Actions
+每日增量更新脚本 - 前复权版本
 """
 import os
 import sqlite3
 import logging
 from datetime import datetime, timedelta
+import time
 
 import pandas as pd
 import tushare as ts
+from tushare.pro.client import DataApi
 
-# 配置 - 相对路径
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(BASE_DIR, "data", "ath_monitor.db")
 
-# 从环境变量获取 Tushare Token
 TUSHARE_TOKEN = os.environ.get('TUSHARE_TOKEN')
 if not TUSHARE_TOKEN:
     raise ValueError("请设置 TUSHARE_TOKEN 环境变量")
@@ -26,63 +26,64 @@ log = logging.getLogger(__name__)
 
 
 def get_latest_trade_date():
-    """获取最新交易日"""
     today = datetime.now()
-    if today.weekday() >= 5:  # 周末回退到周五
+    if today.weekday() >= 5:
         days_back = today.weekday() - 4
         today = today - timedelta(days=days_back)
-    date_str = today.strftime('%Y%m%d')
+    return today.strftime('%Y%m%d')
+
+
+def fetch_qfq_data(ts_code, trade_date):
+    """获取单只股票前复权数据"""
     try:
-        df_cal = pro.trade_cal(exchange='SSE', start_date=date_str, end_date=date_str)
-        if not df_cal.empty and df_cal.iloc[0]['is_open'] == 0:
-            for i in range(1, 10):
-                prev_date = today - timedelta(days=i)
-                prev_str = prev_date.strftime('%Y%m%d')
-                df_cal = pro.trade_cal(exchange='SSE', start_date=prev_str, end_date=prev_str)
-                if not df_cal.empty and df_cal.iloc[0]['is_open'] == 1:
-                    return prev_str
+        df = ts.pro_bar(
+            ts_code=ts_code, 
+            start_date=trade_date, 
+            end_date=trade_date, 
+            adj='qfq'
+        )
+        if df is None or df.empty:
+            return None
+        return df.iloc[0]
     except Exception as e:
-        log.warning(f"获取交易日历失败: {e}")
-    return date_str
-
-
-def get_stock_list(conn):
-    return pd.read_sql("SELECT ts_code, name, industry, latest_ath_high FROM ath_latest", conn)
-
-
-def fetch_daily_price(ts_code, trade_date):
-    try:
-        df = pro.daily(ts_code=ts_code, start_date=trade_date, end_date=trade_date)
-        return df.iloc[0] if not df.empty else None
-    except:
         return None
 
 
 def update_daily():
     log.info("=" * 50)
-    log.info("开始每日增量更新")
+    log.info("开始每日增量更新（前复权版本）")
     
     conn = sqlite3.connect(DB_PATH)
     trade_date = get_latest_trade_date()
     log.info(f"更新日期: {trade_date}")
     
-    stocks = get_stock_list(conn)
+    # 获取股票列表
+    stocks = pd.read_sql("SELECT ts_code, name, industry, latest_ath_high FROM ath_latest", conn)
     log.info(f"共 {len(stocks)} 只股票需要检查")
     
     new_breakouts = []
-    for _, row in stocks.iterrows():
+    checked = 0
+    
+    for idx, row in stocks.iterrows():
         ts_code = row['ts_code']
         latest_ath_high = row['latest_ath_high']
-        if latest_ath_high is None:
+        
+        if latest_ath_high is None or pd.isna(latest_ath_high):
             continue
         
-        daily = fetch_daily_price(ts_code, trade_date)
+        # 获取前复权数据
+        daily = fetch_qfq_data(ts_code, trade_date)
         if daily is None:
             continue
+        
+        checked += 1
+        if checked % 100 == 0:
+            log.info(f"已检查 {checked}/{len(stocks)} 只股票")
         
         try:
             close = float(daily['close'])
             prev_high = float(latest_ath_high)
+            
             if close > prev_high:
                 log.info(f"突破: {ts_code} 收盘:{close:.2f} > 前高:{prev_high:.2f}")
                 new_breakouts.append({
