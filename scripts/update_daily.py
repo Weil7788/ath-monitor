@@ -70,7 +70,7 @@ def update_daily():
     
     for _, row in stocks.iterrows():
         ts_code = row['ts_code']
-        print(f'开始检查{ts_code}')
+        log.info(f'开始检查{ts_code}')
         latest_ath_high = row['latest_ath_high']
         if latest_ath_high is None or pd.isna(latest_ath_high):
             continue
