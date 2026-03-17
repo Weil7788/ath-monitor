@@ -1,14 +1,15 @@
 """
-生成 ATH Monitor 可视化 HTML 页面 v2
+生成 ATH Monitor 可视化 HTML 页面 v3
 包含：
 1. 今日历史新高股票模块（行业分组、行业得分、近5日突破次数）
 2. 每日突破历史新高股票数量折线图
-3. 行业热力图（优化色阶 + 近5/10/20日短周期）
+3. 行业热力图（筛选过滤 + 优化颜色 + 同花顺链接）
 """
 import sqlite3
 import pandas as pd
 import json
 import os
+
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH = os.path.join(BASE_DIR, "data", "ath_monitor.db")
 OUTPUT_PATH = os.path.join(BASE_DIR, "docs", "index.html")
@@ -62,22 +63,51 @@ daily_ind_recent = daily_ind[daily_ind['trade_date'].isin(recent_dates)].copy()
 pivot = daily_ind_recent.pivot(index='industry', columns='trade_date', values='score').fillna(0)
 pivot = pivot.reindex([i for i in all_industries if i in pivot.index])
 
+# 【新功能1】过滤掉周期内没有1天得分>1的行业（基于120日默认范围）
+def filter_industries(pivot_df, threshold=1.0):
+    """过滤：在默认范围内(120日)没有任何一天得分超过threshold的行业"""
+    default_range = 120
+    total = pivot_df.shape[1]
+    start = max(0, total - default_range)
+    visible_data = pivot_df.iloc[:, start:]
+    max_scores = visible_data.max(axis=1)
+    return max_scores[max_scores > threshold].index.tolist()
+
+# 获取默认120日内有得分>1的行业
+active_industries = filter_industries(pivot, threshold=1.0)
+print(f"过滤前行业数: {len(pivot.index)}, 过滤后(120日内有得分>1): {len(active_industries)}")
+
+# 保留所有行业用于筛选，但默认显示活跃的
 heatmap_dates = sorted(recent_dates)
 heatmap_dates_fmt = [pd.Timestamp(d).strftime('%Y-%m-%d') for d in heatmap_dates]
-heatmap_industries = pivot.index.tolist()
+heatmap_industries = pivot.index.tolist()  # 保留所有行业
 heatmap_matrix = pivot.values.tolist()
 
-# 5. 点击详情数据
+# 同时保存活跃行业索引，用于前端筛选
+active_industry_indices = [heatmap_industries.index(ind) for ind in active_industries if ind in heatmap_industries]
+
+# 5. 点击详情数据 - 增加同花顺链接所需信息
 detail_map = {}
 for (date, ind), grp in df_all[df_all['trade_date'].isin(recent_dates)].groupby(['trade_date', 'industry']):
     key = f"{date}|{ind}"
     stocks = []
     for _, row in grp.iterrows():
+        ts_code = str(row['ts_code'])
+        # 生成同花顺链接
+        if ts_code.endswith('.SZ'):
+            jqka_code = ts_code.replace('.SZ', '')
+        elif ts_code.endswith('.SH'):
+            jqka_code = ts_code.replace('.SH', '')
+        else:
+            jqka_code = ts_code
+        jqka_link = f"https://stockpage.10jqka.com.cn/{jqka_code}/"
+
         stocks.append({
-            'ts_code': row['ts_code'],
+            'ts_code': ts_code,
             'name': str(row['name']),
             'close': round(float(row['close']), 2) if pd.notna(row['close']) else 0,
             'pct_chg': round(float(row['pct_chg']), 2) if pd.notna(row['pct_chg']) else 0,
+            'jqka_link': jqka_link
         })
     detail_map[key] = stocks
 
@@ -85,12 +115,10 @@ for (date, ind), grp in df_all[df_all['trade_date'].isin(recent_dates)].groupby(
 latest_date = sorted(df_all['trade_date'].unique())[-1]
 latest_date_fmt = pd.Timestamp(latest_date).strftime('%Y-%m-%d')
 
-# 近5日日期
 dates_5d = sorted(df_all['trade_date'].unique())[-5:]
 
 df_today = df_all[df_all['trade_date'] == latest_date].copy()
 
-# 今日每行业突破数 & 得分
 today_ind_cnt = df_today.groupby('industry')['ts_code'].count().reset_index()
 today_ind_cnt.columns = ['industry', 'today_breakout']
 today_ind_cnt['total_stocks'] = today_ind_cnt['industry'].map(ind_total_dict).fillna(1).astype(int)
@@ -98,18 +126,26 @@ today_ind_cnt['score'] = (today_ind_cnt['today_breakout'] ** 2) / today_ind_cnt[
 today_ind_cnt['score'] = today_ind_cnt['score'].round(4)
 today_ind_score = dict(zip(today_ind_cnt['industry'], today_ind_cnt['score']))
 
-# 每只今日股票近5日突破次数
 df_5d = df_all[df_all['trade_date'].isin(dates_5d)]
 cnt_5d = df_5d.groupby('ts_code')['trade_date'].count().reset_index()
 cnt_5d.columns = ['ts_code', 'cnt_5d']
 cnt_5d_dict = dict(zip(cnt_5d['ts_code'], cnt_5d['cnt_5d']))
 
-# 构建今日股票列表，按行业得分 desc, 涨跌幅 desc 排序
+# 构建今日股票列表 - 增加同花顺链接
 today_stocks = []
 for _, row in df_today.sort_values(['industry', 'pct_chg'], ascending=[True, False]).iterrows():
     ind = row['industry']
+    ts_code = str(row['ts_code'])
+    if ts_code.endswith('.SZ'):
+        jqka_code = ts_code.replace('.SZ', '')
+    elif ts_code.endswith('.SH'):
+        jqka_code = ts_code.replace('.SH', '')
+    else:
+        jqka_code = ts_code
+    jqka_link = f"https://stockpage.10jqka.com.cn/{jqka_code}/"
+
     today_stocks.append({
-        'ts_code': row['ts_code'],
+        'ts_code': ts_code,
         'name': str(row['name']),
         'industry': ind,
         'ind_score': today_ind_score.get(ind, 0),
@@ -117,8 +153,8 @@ for _, row in df_today.sort_values(['industry', 'pct_chg'], ascending=[True, Fal
         'close': round(float(row['close']), 2) if pd.notna(row['close']) else 0,
         'pct_chg': round(float(row['pct_chg']), 2) if pd.notna(row['pct_chg']) else 0,
         'cnt_5d': int(cnt_5d_dict.get(row['ts_code'], 1)),
+        'jqka_link': jqka_link
     })
-# 按行业得分降序
 today_stocks.sort(key=lambda x: (-x['ind_score'], -x['pct_chg']))
 
 print(f"折线图数据点: {len(line_dates)}")
@@ -210,6 +246,8 @@ body {
 }
 .stock-name { font-weight: 500; color: #e6edf3; min-width: 72px; }
 .stock-code { font-size: 11px; color: #8b949e; min-width: 90px; }
+.stock-code a { color: #58a6ff; text-decoration: none; }
+.stock-code a:hover { text-decoration: underline; }
 .stock-price { color: #8b949e; min-width: 60px; }
 .stock-pct { font-weight: 600; min-width: 60px; }
 .stock-5d {
@@ -239,7 +277,8 @@ body {
 .range-btn:hover { background: #1c2128; color: #e6edf3; }
 .range-btn.active { background: #1f6feb22; border-color: #1f6feb; color: #58a6ff; }
 .ctrl-divider { width: 1px; background: #30363d; margin: 0 4px; }
-#heatmapChart { width: 100%; height: 700px; }
+/* 【新功能3】热力图高度拉高 */
+#heatmapChart { width: 100%; height: 1000px; }
 .legend-row {
   display: flex; align-items: center; gap: 16px; margin-top: 8px;
   font-size: 12px; color: #8b949e; flex-wrap: wrap;
@@ -273,6 +312,8 @@ body {
 }
 .stk-table td { padding: 7px 10px; border-bottom: 1px solid #0d1117; }
 .stk-table tr:hover td { background: #1c2128; }
+.stk-table .ts-code a { color: #58a6ff; text-decoration: none; }
+.stk-table .ts-code a:hover { text-decoration: underline; }
 </style>
 </head>
 <body>
@@ -321,9 +362,15 @@ body {
       <button class="range-btn" onclick="setRange(250)">近250日</button>
       <button class="range-btn" onclick="setRange(500)">近500日</button>
     </div>
+    <div class="ctrl-divider"></div>
+    <!-- 【新功能1】添加筛选按钮 -->
+    <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:12px;color:#8b949e;">
+      <input type="checkbox" id="filterActive" checked onchange="renderHeatmap()">
+      仅显示120日内有得分>1的行业
+    </label>
     <div class="legend-row">
-      <div class="legend-item"><div class="legend-dot" style="background:#f85149"></div>极强(>3)</div>
-      <div class="legend-item"><div class="legend-dot" style="background:#e09921"></div>强(1~3)</div>
+      <div class="legend-item"><div class="legend-dot" style="background:#f85149"></div>强(>2)</div>
+      <div class="legend-item"><div class="legend-dot" style="background:#e67e22"></div>中强(1~2)</div>
       <div class="legend-item"><div class="legend-dot" style="background:#3b82f6"></div>中(0.3~1)</div>
       <div class="legend-item"><div class="legend-dot" style="background:#1d4572"></div>弱(0.1~0.3)</div>
       <div class="legend-item"><div class="legend-dot" style="background:#0d1117;border:1px solid #30363d"></div>无</div>
@@ -356,10 +403,10 @@ const HEATMAP_MATRIX    = __HEATMAP_MATRIX__;
 const DETAIL_MAP   = __DETAIL_MAP__;
 const TODAY_STOCKS = __TODAY_STOCKS__;
 const LATEST_DATE  = '__LATEST_DATE_RAW__';
+const ACTIVE_INDUSTRIES = __ACTIVE_INDUSTRIES__;
 
 // ===== 今日新高模块 =====
 (function renderToday() {
-  // 统计数据
   const total = TODAY_STOCKS.length;
   const inds = [...new Set(TODAY_STOCKS.map(s => s.industry))];
   const maxScore = TODAY_STOCKS.reduce((m, s) => Math.max(m, s.ind_score), 0);
@@ -382,7 +429,6 @@ const LATEST_DATE  = '__LATEST_DATE_RAW__';
     return;
   }
 
-  // 按行业分组
   const groups = {};
   TODAY_STOCKS.forEach(s => {
     if (!groups[s.industry]) groups[s.industry] = { score: s.ind_score, total: s.ind_total, stocks: [] };
@@ -410,10 +456,11 @@ const LATEST_DATE  = '__LATEST_DATE_RAW__';
           const dots = Array.from({length: 5}, (_, i) =>
             `<div class="dot ${i < s.cnt_5d ? 'dot-hit' : 'dot-miss'}"></div>`
           ).join('');
+          // 【新功能2】股票代码添加同花顺链接
           return `
           <div class="stock-row">
             <span class="stock-name">${s.name}</span>
-            <span class="stock-code">${s.ts_code}</span>
+            <span class="stock-code"><a href="${s.jqka_link}" target="_blank">${s.ts_code}</a></span>
             <span class="stock-price">¥${s.close}</span>
             <span class="stock-pct ${s.pct_chg >= 0 ? 'up' : 'down'}">${s.pct_chg >= 0 ? '+' : ''}${s.pct_chg}%</span>
             <div class="stock-5d">
@@ -426,7 +473,6 @@ const LATEST_DATE  = '__LATEST_DATE_RAW__';
       </div>
     `;
     container.appendChild(div);
-    // 得分>1 默认展开
     if (sc > 1) toggleGroup(gi);
   });
 })();
@@ -508,18 +554,24 @@ function getVisibleRange(range) {
   };
 }
 
-// 对数映射：让低分段颜色差异更明显
-// 原始分数 -> 颜色映射值（log scale）
+// 【新功能4】优化颜色映射，让1-2分更醒目
 function logScale(score) {
   if (score <= 0) return 0;
-  // log(1 + score*5) / log(1 + 5*maxScore)  → 归一化到 [0,1]
-  // 直接返回 log(1 + score) 让echarts visualMap用 log 空间
-  return Math.log1p(score * 4);
+  // 使用更激进的映射，让低分更明显
+  // score 0.3 -> 约1.2, score 1 -> 约2, score 2 -> 约3
+  return Math.log1p(score * 3);
 }
 
-function buildHeatmapData(dates, matrix) {
+function buildHeatmapData(dates, matrix, industries, filterEnabled) {
   const data = [];
-  for (let r = 0; r < ALL_INDUSTRIES.length; r++) {
+  // 如果启用筛选，只显示活跃行业
+  const visibleIndustries = filterEnabled ? ACTIVE_INDUSTRIES : industries;
+  
+  for (let r = 0; r < industries.length; r++) {
+    const indName = industries[r];
+    // 如果启用筛选但该行业不活跃，跳过
+    if (filterEnabled && !ACTIVE_INDUSTRIES.includes(indName)) continue;
+    
     for (let c = 0; c < dates.length; c++) {
       const raw = matrix[r] ? (matrix[r][c] || 0) : 0;
       const val = logScale(raw);
@@ -528,11 +580,11 @@ function buildHeatmapData(dates, matrix) {
           value: [c, r, val],
           _raw: raw,
           itemStyle: {
-            borderColor: raw > 3 ? '#f85149cc' : '#d29922cc',
+            borderColor: raw > 2 ? '#f85149cc' : '#e67e22cc',
             borderWidth: 1.5
           }
         });
-      } else {
+      } else if (raw > 0) {
         data.push({ value: [c, r, val], _raw: raw });
       }
     }
@@ -542,10 +594,10 @@ function buildHeatmapData(dates, matrix) {
 
 function renderHeatmap() {
   const { dates, datesFmt, matrix } = getVisibleRange(currentRange);
-  const heatData = buildHeatmapData(dates, matrix);
-  const logMax = Math.log1p(10 * 4); // 对应原始分数约10的映射上限
+  const filterEnabled = document.getElementById('filterActive').checked;
+  const heatData = buildHeatmapData(dates, matrix, ALL_INDUSTRIES, filterEnabled);
+  const logMax = Math.log1p(8 * 3); // 调整上限
 
-  // x轴标签间隔
   const labelInterval = dates.length <= 10 ? 0
     : dates.length <= 25 ? 1
     : Math.floor(dates.length / 20);
@@ -558,7 +610,8 @@ function renderHeatmap() {
       textStyle: { color: '#e6edf3', fontSize: 12 },
       formatter: params => {
         const raw = params.data;
-        const arr = Array.isArray(raw) ? raw.value : raw.value;
+        if (!raw) return '';
+        const arr = Array.isArray(raw.value) ? raw.value : raw.value;
         const [colIdx, rowIdx] = arr;
         const score = raw._raw !== undefined ? raw._raw : 0;
         const ind = ALL_INDUSTRIES[rowIdx];
@@ -568,12 +621,12 @@ function renderHeatmap() {
         const stocks = DETAIL_MAP[key] || [];
         let tip = `<b>${dateFmt}</b> &nbsp; ${ind}<br/>`;
         tip += `突破股票：<b>${stocks.length}</b> 只`;
-        if (score > 0) tip += `&nbsp;·&nbsp; 强度得分：<b style="color:${score>3?'#f85149':score>1?'#d29922':'#58a6ff'}">${score.toFixed(3)}</b>`;
+        if (score > 0) tip += `&nbsp;·&nbsp; 强度得分：<b style="color:${score>2?'#f85149':score>1?'#e67e22':'#58a6ff'}">${score.toFixed(3)}</b>`;
         if (stocks.length > 0) tip += `<br/><span style="color:#8b949e;font-size:11px">点击查看详情</span>`;
         return tip;
       }
     },
-    grid: { top: 8, left: 90, right: 20, bottom: 50 },
+    grid: { top: 8, left: 100, right: 20, bottom: 50 },
     xAxis: {
       type: 'category', data: datesFmt, splitArea: { show: false },
       axisLabel: { color: '#8b949e', fontSize: 9, rotate: 45, interval: labelInterval },
@@ -587,21 +640,19 @@ function renderHeatmap() {
     visualMap: {
       min: 0, max: logMax,
       calculable: false,
-      show: false,  // 隐藏默认visualMap，用自定义图例
+      show: false,
       inRange: {
-        // 5段对数色阶：黑 → 深蓝 → 蓝 → 橙 → 红
+        // 【新功能4】优化颜色：0分保持深色，0.3开始变蓝，1开始变橙，2以上变红
         color: [
-          '#0d1117',  // 0    无
-          '#0d2137',  // 极低
-          '#0f3460',  // 低
-          '#1a5276',  // 低中
-          '#1d6fa4',  // 中低
-          '#2e86c1',  // 中
-          '#3b9dd2',  // 中高
-          '#d4ac0d',  // 高（黄）
-          '#e67e22',  // 高（橙）
-          '#e74c3c',  // 极高（红橙）
-          '#c0392b',  // 极强（深红）
+          '#0d1117',  // 0 无
+          '#0d2137',  // 0-0.1 极弱
+          '#0f3460',  // 0.1-0.3 弱
+          '#1a5276',  // 0.3-0.5 较弱
+          '#2e86c1',  // 0.5-1 中
+          '#e67e22',  // 1-1.5 中强 (橙色开始醒目!)
+          '#f39c12',  // 1.5-2 较强
+          '#e74c3c',  // 2-3 强
+          '#c0392b',  // >3 极强
         ]
       }
     },
@@ -629,6 +680,7 @@ renderHeatmap();
 heatChart.on('click', params => {
   if (params.componentType !== 'series') return;
   const raw = params.data;
+  if (!raw) return;
   const arr = raw.value;
   const [colIdx, rowIdx] = arr;
   const score = raw._raw !== undefined ? raw._raw : 0;
@@ -647,10 +699,11 @@ function showModal(date, industry, score, stocks) {
   const pillCls = score > 3 ? 'ind-score-high' : score > 1 ? 'ind-score-mid' : 'ind-score-low';
   document.getElementById('modalTitle').innerHTML =
     `${date} &nbsp;·&nbsp; ${industry} &nbsp;<span class="ind-score-pill ${pillCls}">得分 ${score.toFixed(3)}</span>`;
+  // 【新功能2】弹窗中也添加同花顺链接
   const rows = stocks.map(s => `
     <tr>
       <td>${s.name}</td>
-      <td style="color:#8b949e;font-size:11px">${s.ts_code}</td>
+      <td class="ts-code"><a href="${s.jqka_link}" target="_blank">${s.ts_code}</a></td>
       <td>¥${s.close}</td>
       <td class="${s.pct_chg >= 0 ? 'up' : 'down'}">${s.pct_chg >= 0 ? '+' : ''}${s.pct_chg}%</td>
     </tr>`).join('');
@@ -671,7 +724,7 @@ function setRange(n) {
   currentRange = n;
   document.querySelectorAll('.range-btn').forEach(btn => {
     const txt = btn.textContent.trim();
-    btn.classList.toggle('active', txt === `近${n}日` || txt === `近${n}日`);
+    btn.classList.toggle('active', txt === `近${n}日`);
   });
   renderHeatmap();
 }
@@ -687,6 +740,7 @@ html = HTML
 html = html.replace('__LINE_DATES__',       json.dumps(line_dates,         ensure_ascii=False))
 html = html.replace('__LINE_COUNTS__',      json.dumps(line_counts))
 html = html.replace('__ALL_INDUSTRIES__',   json.dumps(heatmap_industries, ensure_ascii=False))
+html = html.replace('__ACTIVE_INDUSTRIES__', json.dumps(active_industries,   ensure_ascii=False))
 html = html.replace('__HEATMAP_DATES__',    json.dumps(heatmap_dates,      ensure_ascii=False))
 html = html.replace('__HEATMAP_DATES_FMT__',json.dumps(heatmap_dates_fmt,  ensure_ascii=False))
 html = html.replace('__HEATMAP_MATRIX__',   json.dumps(heatmap_matrix))
